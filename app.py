@@ -1,8 +1,10 @@
 from flask import Flask, request, jsonify
 import os
 import json
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
 
 STATUS_FILE = "switch_status.json"
 
@@ -40,5 +42,5 @@ def upd():
     # Test: Always respond with OFF
     return jsonify(cmd="OFF")
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+# if __name__ == "__main__":
+#     app.run(debug=True, host="0.0.0.0", port=5000)
