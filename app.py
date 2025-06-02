@@ -1,152 +1,134 @@
+"""
+Motor-switch backend  –  Full, robust version
+─────────────────────────────────────────────
+• Keeps ON/OFF state in switch_status.json
+• Logs every ON→OFF event (even across restarts) in motor_log.json
+• Queues notifications in notify_queue.json
+• Auto-OFF after 50 min, with notification
+• Thread-safe (single-process) – suitable for PythonAnywhere small apps
+"""
+
 from flask import Flask, request, jsonify
-import os
-import json
-import threading
-from datetime import datetime, timedelta
 from flask_cors import CORS
+import os, json, threading
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-STATUS_FILE = "switch_status.json"
-LOG_FILE = "motor_log.json"
-NOTIFY_FILE = "notify_queue.json"
+# ───── file paths ───────────────────────────────────────────
+STATUS_FILE   = "switch_status.json"
+LOG_FILE      = "motor_log.json"
+NOTIFY_FILE   = "notify_queue.json"
+LAST_ON_FILE  = "last_on_time.txt"     # single line ISO string
 
-AUTO_OFF_MINS = 50
+AUTO_OFF_MIN  = 50
+auto_off_timer = None                  # threading.Timer handle
 
-# For tracking the current ON event and the auto-off timer
-auto_off_timer = None
-on_event = {}
+# ───── helpers ──────────────────────────────────────────────
+def read_json(path, fallback):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return fallback
 
-def get_status():
+def write_json(path, data):
+    json.dump(data, open(path, "w"), indent=2)
+
+def get_status() -> bool:
     if not os.path.exists(STATUS_FILE):
-        with open(STATUS_FILE, "w") as f:
-            json.dump({"isOn": False}, f)
-    with open(STATUS_FILE, "r") as f:
-        return json.load(f)
+        write_json(STATUS_FILE, {"isOn": False})
+    return read_json(STATUS_FILE, {"isOn": False})
 
-def set_status(is_on):
-    with open(STATUS_FILE, "w") as f:
-        json.dump({"isOn": is_on}, f)
+def set_status(state: bool):
+    write_json(STATUS_FILE, {"isOn": state})
 
-def append_log(on_time, off_time):
-    duration_sec = int((off_time - on_time).total_seconds())
-    log = []
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "r") as f:
-            try:
-                log = json.load(f)
-            except:
-                log = []
+def add_notification(msg: str):
+    q = read_json(NOTIFY_FILE, [])
+    q.append({"time": datetime.now().isoformat(), "msg": msg})
+    write_json(NOTIFY_FILE, q)
+    print("🔔", msg, flush=True)
+
+def append_log(on_iso: str, off_dt: datetime):
+    log = read_json(LOG_FILE, [])
+    secs = int((off_dt - datetime.fromisoformat(on_iso)).total_seconds())
     log.append({
-        "on_time": on_time.isoformat(),
-        "off_time": off_time.isoformat(),
-        "duration_sec": duration_sec
+        "on_time":  on_iso,
+        "off_time": off_dt.isoformat(),
+        "duration_sec": secs
     })
-    with open(LOG_FILE, "w") as f:
-        json.dump(log, f, indent=2)
+    write_json(LOG_FILE, log)
+    print(f"📝 Log + {on_iso} → {off_dt.isoformat()}  ({secs}s)", flush=True)
 
-def add_notification(msg):
-    notif = []
-    if os.path.exists(NOTIFY_FILE):
-        with open(NOTIFY_FILE, "r") as f:
-            try:
-                notif = json.load(f)
-            except:
-                notif = []
-    notif.append({
-        "time": datetime.now().isoformat(),
-        "msg": msg
-    })
-    with open(NOTIFY_FILE, "w") as f:
-        json.dump(notif, f, indent=2)
+def schedule_auto_off():
+    global auto_off_timer
+    if auto_off_timer: auto_off_timer.cancel()
+    auto_off_timer = threading.Timer(AUTO_OFF_MIN*60, auto_turn_off)
+    auto_off_timer.start()
+    print("⏳ Auto-OFF timer set (50 min)", flush=True)
 
+# ───── auto-OFF callback ────────────────────────────────────
 def auto_turn_off():
-    global auto_off_timer, on_event
-    print("⏰ Auto-off: Turning motor OFF after 50 mins.", flush=True)
-    set_status(False)
-    off_time = datetime.now()
-    add_notification("Motor turned OFF automatically after 50 mins.")
-    if on_event.get("on_time"):
-        append_log(on_event["on_time"], off_time)
-    on_event = {}
+    global auto_off_timer
+    print("⏰ 50 min elapsed – auto-OFF", flush=True)
+    if get_status().get("isOn"):
+        set_status(False)
+    add_notification("Motor turned OFF automatically after 50 minutes.")
+    if os.path.exists(LAST_ON_FILE):
+        on_iso = open(LAST_ON_FILE).read().strip()
+        append_log(on_iso, datetime.now())
+        os.remove(LAST_ON_FILE)
     auto_off_timer = None
 
-@app.route("/switch", methods=['GET'])
-def get_switch():
-    status = get_status()
-    return jsonify(status)
+# ───── API endpoints ────────────────────────────────────────
+@app.route("/switch", methods=["GET"])
+def api_switch_get():
+    return jsonify(get_status())
 
-@app.route("/switch", methods=['POST'])
-def set_switch():
-    global auto_off_timer, on_event
+@app.route("/switch", methods=["POST"])
+def api_switch_set():
+    global auto_off_timer
     data = request.get_json(force=True)
-    is_on = data.get("isOn", None)
-    if is_on is None:
+    if data.get("isOn") is None:
         return jsonify({"error": "Missing isOn"}), 400
+    desired = bool(data["isOn"])
+    current = get_status().get("isOn", False)
+    set_status(desired)
 
-    current_status = get_status().get("isOn", False)
-    set_status(bool(is_on))
+    if desired and not current:                                   # TURN ON
+        now_iso = datetime.now().isoformat()
+        open(LAST_ON_FILE, "w").write(now_iso)
+        add_notification("Motor turned ON – will auto-OFF in 50 min.")
+        schedule_auto_off()
 
-    if bool(is_on) and not current_status:
-        # Turned ON: set timer, log ON time, notify
-        on_event["on_time"] = datetime.now()
-        add_notification("Motor turned ON. Will turn OFF in 50 minutes automatically.")
-        if auto_off_timer:
-            auto_off_timer.cancel()
-        auto_off_timer = threading.Timer(AUTO_OFF_MINS * 60, auto_turn_off)
-        auto_off_timer.start()
-    elif not bool(is_on) and current_status:
-        # Turned OFF manually
-        off_time = datetime.now()
+    if not desired and current:                                   # TURN OFF
         add_notification("Motor turned OFF manually.")
-        if on_event.get("on_time"):
-            append_log(on_event["on_time"], off_time)
-        if auto_off_timer:
-            auto_off_timer.cancel()
-            auto_off_timer = None
-        on_event = {}
+        if os.path.exists(LAST_ON_FILE):
+            on_iso = open(LAST_ON_FILE).read().strip()
+            append_log(on_iso, datetime.now())
+            os.remove(LAST_ON_FILE)
+        if auto_off_timer: auto_off_timer.cancel()
 
-    return jsonify({"isOn": bool(is_on)})
+    return jsonify({"isOn": desired})
 
-@app.route("/logs", methods=['GET'])
-def get_logs():
-    if os.path.exists(LOG_FILE):
-        with open(LOG_FILE, "r") as f:
-            try:
-                log = json.load(f)
-            except:
-                log = []
-    else:
-        log = []
-    return jsonify(log)
+@app.route("/logs", methods=["GET"])
+def api_logs():
+    return jsonify(read_json(LOG_FILE, []))
 
-@app.route("/notifications", methods=['GET'])
-def get_notifications():
-    if os.path.exists(NOTIFY_FILE):
-        with open(NOTIFY_FILE, "r") as f:
-            try:
-                notif = json.load(f)
-            except:
-                notif = []
-    else:
-        notif = []
-    return jsonify(notif)
+@app.route("/notifications", methods=["GET"])
+def api_notifications():
+    return jsonify(read_json(NOTIFY_FILE, []))
 
-@app.route("/notifications/clear", methods=['POST'])
-def clear_notifications():
-    # You can clear notifications after showing in app/browser
-    with open(NOTIFY_FILE, "w") as f:
-        json.dump([], f)
+@app.route("/notifications/clear", methods=["POST"])
+def api_notifications_clear():
+    write_json(NOTIFY_FILE, [])
     return jsonify({"cleared": True})
 
-# Backward compatibility (your old ESP route, can keep or remove)
-@app.route("/update", methods=['POST'])
-def upd():
-    data = request.get_json(force=True)
-    print(f"ESP sent: {data}", flush=True)
-    # Test: Always respond with OFF
+@app.route("/update", methods=["POST"])   # legacy / ESP
+def api_update():
+    print("ESP payload:", request.get_json(force=True), flush=True)
     return jsonify(cmd="OFF")
 
+# ───── main (comment-out on PythonAnywhere) ────────────────
 # if __name__ == "__main__":
 #     app.run(debug=True, host="0.0.0.0", port=5000)
